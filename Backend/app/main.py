@@ -35,10 +35,19 @@ from app.schemas import (
 )
 from app.session import get_session_store
 from app.tools.mcp_tools import load_mcp_tools, mcp_available
+from app.tracing import check_connectivity as check_langsmith_connectivity
+from app.tracing import configure as configure_langsmith
 
 settings = get_settings()
 configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
+
+# Must run before any LangGraph/LangChain call could happen - LangChain's tracing
+# on/off check is memoized process-wide the first time anything asks, so this has to
+# win that race. Nothing above this line invokes a Runnable (building an agent only
+# constructs a graph object; check_model_availability below is a raw httpx call), so
+# this is early enough.
+langsmith_enabled = configure_langsmith()
 
 
 @asynccontextmanager
@@ -53,12 +62,15 @@ async def lifespan(app: FastAPI):
     # load + embedding latency. Failure here is non-fatal - search() falls back to
     # sparse-only, this just avoids a silent surprise on the first request.
     dense_available = await get_rag_store().warm_up()
+    langsmith_connected = await check_langsmith_connectivity() if langsmith_enabled else False
     logger.info(
         "application ready",
         extra={
             "event": "app.ready",
             "mcp_available": mcp_available(),
             "dense_search_available": dense_available,
+            "langsmith_enabled": langsmith_enabled,
+            "langsmith_connected": langsmith_connected,
             "model": settings.model,
             "llm_base_url": settings.llm_base_url,
         },
@@ -211,6 +223,7 @@ async def health() -> dict:
         "document_types": DOCUMENT_TYPES,
         "role_tools": {role: sorted(tools) for role, tools in ROLE_TOOLS.items()},
         "dense_search_available": get_rag_store().dense_available,
+        "langsmith_enabled": langsmith_enabled,
     }
 
 

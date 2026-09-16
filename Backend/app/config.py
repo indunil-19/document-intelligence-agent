@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     # dense/semantic, 0.0 = pure BM25/keyword.
     hybrid_alpha: float = 0.5
 
+    # --- Observability (LangSmith) ---
+    # Optional. Off by default - this app runs fine with none of this set.
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""
+    langsmith_project: str = "doc-intelligence-api"
+    # Override for self-hosted or region-specific LangSmith deployments (e.g. EU).
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+
     # --- Retrieval behaviour ---
     # Tool rounds the retrieval agent may take before it is cut off.
     max_retrieval_steps: int = 10

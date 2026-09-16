@@ -19,6 +19,7 @@ from app.graph.builder import get_graph
 from app.logging_config import request_id_var, session_id_var
 from app.schemas import ChatRequest, ChatResponse, SourceDocument
 from app.session import get_session_store
+from app.tracing import trace_config
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,12 @@ async def stream_chat(
             )
 
             final_state = await get_graph().ainvoke(
-                _build_initial_state(request, session, role)
+                _build_initial_state(request, session, role),
+                config=trace_config(
+                    request_id=request_id_var.get(request_id),
+                    session_id=session.session_id,
+                    role=role,
+                ),
             )
 
             answer = final_state.get("answer", "")

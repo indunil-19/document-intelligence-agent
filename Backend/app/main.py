@@ -7,13 +7,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.chat_service import handle_chat
+from app.auth import ROLE_TOOLS, authenticate, resolve_role
+from app.chat_service import handle_chat, stream_chat
 from app.config import env_file_status, get_settings
-from app.errors import AppError
+from app.errors import AppError, AuthenticationError
 from app.graph.builder import build_graph
-from app.graph.nodes.retrieval import build_retrieval_agent
+from app.graph.nodes.retrieval import build_retrieval_agents
 from app.llm import check_model_availability
 from app.logging_config import (
     configure_logging,
@@ -24,7 +25,15 @@ from app.logging_config import (
 from app.mock.mock_api import router as mock_api_router
 from app.mock.rag import DOCUMENT_TYPES
 from app.rate_limit import enforce_rate_limit
-from app.schemas import ChatRequest, ChatResponse, ErrorResponse
+from app.schemas import (
+    ChatRequest,
+    ChatResponse,
+    ErrorResponse,
+    LoginRequest,
+    LoginResponse,
+    SessionResponse,
+)
+from app.session import get_session_store
 from app.tools.mcp_tools import load_mcp_tools, mcp_available
 
 settings = get_settings()
@@ -35,9 +44,9 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("settings loaded", extra={"event": "app.settings", **env_file_status()})
-    # MCP tools first: the retrieval agent binds whatever is available at build time.
+    # MCP tools first: the retrieval agents bind whatever is available at build time.
     await load_mcp_tools()
-    build_retrieval_agent()
+    build_retrieval_agents()
     build_graph()
     await check_model_availability()
     logger.info(
@@ -122,19 +131,69 @@ async def unhandled_error_handler(request: Request, exc: Exception):
     )
 
 
+@app.post("/auth/login", response_model=LoginResponse, tags=["auth"])
+async def login(payload: LoginRequest) -> LoginResponse:
+    """Demo login. Checks a hardcoded username/password and returns the role.
+
+    There are exactly three accounts, one per role - see app/auth.py. This is not a
+    real auth system: no token is issued, and the same X-User-Id header used here is
+    trusted as-is on /chat and /chat/stream. It exists so the frontend has an actual
+    gate to walk through instead of a bare role dropdown.
+    """
+    user = authenticate(payload.username, payload.password)
+    if user is None:
+        raise AuthenticationError("Invalid username or password.")
+    return LoginResponse(
+        username=user.username, role=user.role, display_name=user.display_name
+    )
+
+
+@app.post("/session", response_model=SessionResponse, tags=["chat"])
+async def create_session() -> SessionResponse:
+    """Mint a fresh chat session id.
+
+    Call this once per new conversation and pass the id back as `session_id` on
+    every /chat or /chat/stream call to keep history and cached filter results.
+    """
+    session = await get_session_store().get_or_create(None)
+    return SessionResponse(session_id=session.session_id)
+
+
 @app.post(
     "/chat",
     response_model=ChatResponse,
     tags=["chat"],
     dependencies=[Depends(enforce_rate_limit)],
 )
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
     """Ask a question about internal documentation.
 
     Pass the returned `session_id` back on the next call to keep conversation
-    history and cached filter results.
+    history and cached filter results. Which tools the retrieval agent may use
+    depends on the caller's role, resolved from the X-User-Id header (see
+    app/auth.py); an unrecognised or missing header defaults to the viewer role.
     """
-    return await handle_chat(request, request_id_var.get())
+    role = resolve_role(http_request)
+    return await handle_chat(request, request_id_var.get(), role)
+
+
+@app.post(
+    "/chat/stream",
+    tags=["chat"],
+    dependencies=[Depends(enforce_rate_limit)],
+)
+async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingResponse:
+    """Same as /chat, but streams NDJSON activity events as the turn runs.
+
+    Each line is one app.schemas.ActivityEvent. The stream ends with a `"final"`
+    line carrying the completed ChatResponse payload, or an `"error"` line if the
+    turn failed. This is what the Streamlit Agent Activity Panel consumes.
+    """
+    role = resolve_role(http_request)
+    return StreamingResponse(
+        stream_chat(request, request_id_var.get(), role),
+        media_type="application/x-ndjson",
+    )
 
 
 @app.get("/health", tags=["ops"])
@@ -145,6 +204,7 @@ async def health() -> dict:
         "llm_base_url": settings.llm_base_url,
         "mcp_available": mcp_available(),
         "document_types": DOCUMENT_TYPES,
+        "role_tools": {role: sorted(tools) for role, tools in ROLE_TOOLS.items()},
     }
 
 

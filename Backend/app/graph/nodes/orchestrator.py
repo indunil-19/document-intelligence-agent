@@ -5,6 +5,7 @@ from typing import Literal
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from app.activity import emit
 from app.agents.loader import load_instructions
 from app.graph.state import ChatState
 from app.llm import get_llm
@@ -43,6 +44,7 @@ def _format_history(history: list[dict[str, str]]) -> str:
 
 async def orchestrator_node(state: ChatState) -> ChatState:
     question = state["question"]
+    emit("node_start", node="orchestrate", message="Understanding intent and checking scope")
     llm = get_llm().with_structured_output(OrchestratorDecision)
 
     prompt = (
@@ -62,6 +64,12 @@ async def orchestrator_node(state: ChatState) -> ChatState:
             "orchestrator failed; defaulting to retrieval",
             extra={"event": "node.orchestrator.error"},
         )
+        emit(
+            "validation",
+            node="orchestrate",
+            message="Orchestrator unavailable; defaulting to retrieval",
+        )
+        emit("node_end", node="orchestrate", message="Routing to retrieval (fallback)")
         return {
             "intent": "Unclassified request; routed to retrieval as a fallback.",
             "intent_type": "lookup",
@@ -83,6 +91,25 @@ async def orchestrator_node(state: ChatState) -> ChatState:
             "intent_type": decision.intent_type,
             "in_scope": decision.in_scope,
         },
+    )
+
+    emit(
+        "validation",
+        node="orchestrate",
+        message=(
+            "In scope — routing to retrieval" if decision.in_scope
+            else "Out of scope — declining gracefully"
+        ),
+        in_scope=decision.in_scope,
+        route=decision.route,
+        intent_type=decision.intent_type,
+    )
+    emit(
+        "node_end",
+        node="orchestrate",
+        message=f"Intent: {decision.intent}",
+        route=decision.route,
+        intent_type=decision.intent_type,
     )
 
     return {

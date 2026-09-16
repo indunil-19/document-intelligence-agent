@@ -7,6 +7,7 @@ class ChatState(TypedDict, total=False):
     session_id: str
     question: str
     history: list[dict[str, str]]
+    role: str  # viewer | analyst | admin - controls which tools retrieval may use
 
     # Set by the orchestrator agent
     intent: str

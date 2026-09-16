@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
+from app.activity import emit
 from app.config import get_settings
 from app.llm import get_subagent_llm
 from app.mock.rag import DOCUMENT_TYPES, get_rag_store
@@ -121,6 +122,13 @@ async def filter_by_metadata(
         if session is not None:
             session.cache_documents(signature, documents)
             cached = True
+            emit(
+                "memory_update",
+                tool="filter_by_metadata",
+                message=f"Cached {len(documents)} document(s) in session for analysis",
+                filters=filters,
+                count=len(documents),
+            )
         else:
             cached = False
             logger.warning("no session to cache into", extra={"event": "tool.no_session"})
@@ -163,6 +171,12 @@ def _format_documents(documents: list[dict]) -> str:
 
 async def _analyze_batch(instruction: str, documents: list[dict], batch_no: int) -> str:
     """One analytics sub-agent: analyses a slice of the document set."""
+    tool_name = f"analyze_documents:batch_{batch_no}"
+    emit(
+        "tool_start",
+        tool=tool_name,
+        message=f"Sub-agent analysing batch {batch_no} ({len(documents)} documents)",
+    )
     llm = get_subagent_llm()
     system = (
         "You are an analysis sub-agent. You have been given a subset of a larger "
@@ -175,9 +189,13 @@ async def _analyze_batch(instruction: str, documents: list[dict], batch_no: int)
         f"Instruction: {instruction}\n\n"
         f"Documents in this batch ({len(documents)}):\n\n{_format_documents(documents)}"
     )
-    response = await llm.ainvoke(
-        [SystemMessage(content=system), HumanMessage(content=prompt)]
-    )
+    try:
+        response = await llm.ainvoke(
+            [SystemMessage(content=system), HumanMessage(content=prompt)]
+        )
+    except Exception as exc:  # noqa: BLE001 - let the caller's gather() collect this
+        emit("tool_error", tool=tool_name, message=f"Batch {batch_no} failed: {exc}")
+        raise
     logger.info(
         "analytics sub-agent finished",
         extra={
@@ -186,6 +204,7 @@ async def _analyze_batch(instruction: str, documents: list[dict], batch_no: int)
             "document_count": len(documents),
         },
     )
+    emit("tool_end", tool=tool_name, message=f"Batch {batch_no} analysed")
     return f"### Batch {batch_no} ({len(documents)} documents)\n{response.text}"
 
 
@@ -219,6 +238,11 @@ async def analyze_documents(instruction: str, config: RunnableConfig = None) -> 
                 "analytics inline",
                 extra={"event": "tool.analytics", "mode": "inline", "document_count": total},
             )
+            emit(
+                "retrieval_status",
+                tool="analyze_documents",
+                message=f"Analysing {total} document(s) inline",
+            )
             analysis = await _analyze_batch(instruction, documents, batch_no=1)
             return {
                 "mode": "inline",
@@ -241,6 +265,16 @@ async def analyze_documents(instruction: str, config: RunnableConfig = None) -> 
                 "analysed_count": analysed,
                 "subagents": len(batches),
             },
+        )
+        emit(
+            "retrieval_status",
+            tool="analyze_documents",
+            message=(
+                f"{total} documents exceed the inline threshold - fanning out to "
+                f"{len(batches)} sub-agents"
+            ),
+            subagents=len(batches),
+            document_count=total,
         )
 
         results = await asyncio.gather(

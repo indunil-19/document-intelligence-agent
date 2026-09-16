@@ -43,6 +43,13 @@ class RateLimitError(AppError):
     code = "rate_limited"
 
 
+class AuthenticationError(AppError):
+    """Bad demo-user credentials at /auth/login."""
+
+    status_code = 401
+    code = "authentication_error"
+
+
 class ToolError(AppError):
     """Raised inside a tool. Surfaced back to the agent rather than to the client."""
 

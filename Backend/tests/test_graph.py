@@ -4,6 +4,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.graph.builder import build_graph
 from app.graph.nodes.orchestrator import OrchestratorDecision
+from app.graph.nodes.retrieval import STEP_LIMIT_SENTINEL
 
 
 class FakeStructuredLLM:
@@ -14,8 +15,15 @@ class FakeStructuredLLM:
         return self._decision
 
 
+class _Chunk:
+    """Minimal stand-in for an AIMessageChunk - just the .text property."""
+
+    def __init__(self, text):
+        self.text = text
+
+
 class FakeLLM:
-    """Stands in for ChatAnthropic. Records the prompt it was handed."""
+    """Stands in for ChatOpenAI. Records the prompt it was handed."""
 
     def __init__(self, decision=None, text="stub answer"):
         self._decision = decision
@@ -28,6 +36,10 @@ class FakeLLM:
     async def ainvoke(self, messages):
         self.last_prompt = messages[-1].content
         return AIMessage(content=self._text)
+
+    async def astream(self, messages):
+        self.last_prompt = messages[-1].content
+        yield _Chunk(self._text)
 
 
 class FakeRetrievalAgent:
@@ -68,8 +80,10 @@ def patched(monkeypatch):
             "app.graph.nodes.orchestrator.get_llm", lambda: orchestrator_llm
         )
         monkeypatch.setattr("app.graph.nodes.response.get_llm", lambda: response_llm)
+        # get_retrieval_agent(role) is looked up per-role; every role gets the
+        # same fake here since these tests don't exercise role-based tool access.
         monkeypatch.setattr(
-            "app.graph.nodes.retrieval.get_retrieval_agent", lambda: agent
+            "app.graph.nodes.retrieval.get_retrieval_agent", lambda role: agent
         )
         return orchestrator_llm, response_llm, agent
 
@@ -80,6 +94,7 @@ BASE_STATE = {
     "session_id": "test-session",
     "question": "What does the payment security policy require?",
     "history": [],
+    "role": "viewer",
     "degraded": False,
     "notes": [],
 }
@@ -155,14 +170,17 @@ async def test_failed_retrieval_degrades_instead_of_erroring(patched, monkeypatc
             raise RuntimeError("rag is down")
 
     monkeypatch.setattr(
-        "app.graph.nodes.retrieval.get_retrieval_agent", lambda: ExplodingAgent()
+        "app.graph.nodes.retrieval.get_retrieval_agent", lambda role: ExplodingAgent()
     )
 
     result = await build_graph().ainvoke(BASE_STATE)
 
     assert result["degraded"] is True
     assert result["answer"] == "stub answer"  # user still gets a reply
-    assert "No evidence was gathered" in response_llm.last_prompt
+    # A crashed search is an incomplete search, not proof the information is absent.
+    assert "The search did not finish" in response_llm.last_prompt
+    assert "rag is down" in response_llm.last_prompt
+    assert "does not exist" in response_llm.last_prompt
 
 
 async def test_orchestrator_failure_falls_back_to_retrieval(monkeypatch):
@@ -177,7 +195,7 @@ async def test_orchestrator_failure_falls_back_to_retrieval(monkeypatch):
     monkeypatch.setattr("app.graph.nodes.response.get_llm", lambda: FakeLLM(text="ok"))
     monkeypatch.setattr(
         "app.graph.nodes.retrieval.get_retrieval_agent",
-        lambda: FakeRetrievalAgent([AIMessage(content="evidence")]),
+        lambda role: FakeRetrievalAgent([AIMessage(content="evidence")]),
     )
 
     result = await build_graph().ainvoke(BASE_STATE)
@@ -185,3 +203,36 @@ async def test_orchestrator_failure_falls_back_to_retrieval(monkeypatch):
     assert result["route"] == "retrieval"
     assert result["degraded"] is True
     assert result["answer"] == "ok"
+
+
+async def test_step_limit_cutoff_is_not_reported_as_evidence(patched):
+    """The agent's out-of-steps message must not become an "I found nothing" answer."""
+    messages = [
+        ToolMessage(
+            content='{"results": [{"service_id": "SVC-PAY"}]}',
+            name="service_catalog",
+            tool_call_id="1",
+        ),
+        AIMessage(content=STEP_LIMIT_SENTINEL),
+    ]
+    _, response_llm, _ = patched(_decision(), retrieval_messages=messages)
+
+    result = await build_graph().ainvoke(BASE_STATE)
+
+    assert result["evidence"] == ""            # sentinel discarded
+    assert result["degraded"] is True
+    assert "step budget exhausted" in " ".join(result["notes"])
+    # The response agent is told not to claim the information is absent.
+    assert "did not finish" in response_llm.last_prompt
+    assert "does not exist" in response_llm.last_prompt
+    assert STEP_LIMIT_SENTINEL not in response_llm.last_prompt
+
+
+async def test_role_defaults_to_viewer_when_absent(patched):
+    """retrieval_node must not KeyError when role is missing from state."""
+    _, _, agent = patched(_decision(), retrieval_messages=[AIMessage(content="ok")])
+    state = {k: v for k, v in BASE_STATE.items() if k != "role"}
+
+    result = await build_graph().ainvoke(state)
+
+    assert result["degraded"] is False

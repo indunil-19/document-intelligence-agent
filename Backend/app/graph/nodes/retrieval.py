@@ -18,7 +18,7 @@ from app.auth import ROLE_TOOLS, ROLES, select_tools_for_role
 from app.config import get_settings
 from app.graph.state import ChatState
 from app.llm import get_llm
-from app.mock.rag import get_rag_store
+from app.rag import get_rag_store
 from app.tools.mcp_tools import get_mcp_tools, mcp_available
 from app.tools.rag_tools import RAG_TOOLS
 

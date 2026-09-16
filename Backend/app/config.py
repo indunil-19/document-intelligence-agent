@@ -52,6 +52,17 @@ class Settings(BaseSettings):
     # Buckets untouched for this long are dropped to bound memory.
     rate_limit_idle_ttl_seconds: float = 900.0
 
+    # --- Hybrid search (app/rag/) ---
+    # Local ONNX embedding model (fastembed) - no API key, runs on CPU, weights are
+    # downloaded once and cached under FASTEMBED_CACHE_DIR / ~/.cache.
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Candidates pulled from each of dense/sparse before the two are fused. Larger
+    # catches more near-misses on one axis; smaller is cheaper per query.
+    hybrid_candidate_k: int = 20
+    # Fusion weight: hybrid = alpha * dense + (1 - alpha) * sparse. 1.0 = pure
+    # dense/semantic, 0.0 = pure BM25/keyword.
+    hybrid_alpha: float = 0.5
+
     # --- Retrieval behaviour ---
     # Tool rounds the retrieval agent may take before it is cut off.
     max_retrieval_steps: int = 10

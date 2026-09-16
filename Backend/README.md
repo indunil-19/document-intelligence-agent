@@ -5,14 +5,15 @@ company documents (policies, architecture docs, runbooks, incident reports, prod
 specs, meeting notes), plus a Streamlit frontend that shows the pipeline's internal
 state in real time.
 
-The RAG layer is mocked — `app/mock/rag.py` is a small async facade over a seed corpus.
-Replace its four methods with the real vector store and nothing else changes.
+The document set is a small seed corpus (`app/mock/documents.py`), but retrieval over
+it is real hybrid search — dense embeddings + BM25, fused into one ranking. See
+[Hybrid search](#hybrid-search) below.
 
 ```bash
 # terminal 1
 pip install -r requirements.txt
 cp .env.example .env && $EDITOR .env   # set LLM_API_KEY
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload   # first start downloads the embedding model (~130MB), then caches it
 
 # terminal 2
 pip install -r frontend/requirements.txt
@@ -234,7 +235,7 @@ Things worth trying:
 | `POST /auth/login` | Demo login — checks a hardcoded username/password, returns the role |
 | `POST /session` | Mints a fresh chat session id |
 | `POST /chat/stream` | Same as `/chat`, but streams NDJSON activity events — see below |
-| `GET /health` | Status, model, gateway URL, whether MCP is connected, known document types, the role→tools map |
+| `GET /health` | Status, model, gateway URL, whether MCP is connected, known document types, the role→tools map, whether dense search warmed up |
 | `GET /mock-api/employees` · `/services` | The mock backend the MCP tools consume |
 | `GET /docs` | OpenAPI UI |
 
@@ -343,18 +344,23 @@ All other settings are environment variables (see `.env.example`). `MODEL` and
 pytest
 ```
 
-No API key or network needed — LLM calls are stubbed throughout. Coverage: the
-tools and their failure paths, graph routing (retrieval / direct / out-of-scope),
-evidence and source propagation, degradation when the orchestrator or retrieval
-fails, the analytics inline/fan-out split including partial and total sub-agent
-failure, rate limiting (bucket math against a fake clock, per-caller isolation,
-HTTP-level 429/header/exemption behaviour), roles (the exact tool list per role,
-role resolution and its fail-closed default), activity events (emission, the
-tool-call callback handler, context propagation across concurrent tasks), and
-`/session` / `/auth/login` / `/chat/stream` HTTP framing — all via
-`httpx.ASGITransport` against the real app with the graph stubbed, never a real
-server process or `lifespan` (which would spawn the MCP subprocess and call the LLM
-gateway).
+No API key or network needed, including on a cold cache — LLM calls are stubbed
+throughout and dense search is disabled session-wide by a `conftest.py` fixture
+(BM25 alone is enough to exercise the tool layer; `tests/test_rag.py` injects its
+own fake embedder to test the fusion math without ever loading the real model).
+Coverage: the tools and their failure paths, graph routing (retrieval / direct /
+out-of-scope), evidence and source propagation, degradation when the orchestrator or
+retrieval fails, the analytics inline/fan-out split including partial and total
+sub-agent failure, rate limiting (bucket math against a fake clock, per-caller
+isolation, HTTP-level 429/header/exemption behaviour), roles (the exact tool list
+per role, role resolution and its fail-closed default), activity events (emission,
+the tool-call callback handler, context propagation across concurrent tasks), hybrid
+search (BM25 ranking, cosine similarity, fusion weighting at `alpha=0`/`1`/`0.5`,
+type-filter-before-cut correctness, concurrent warm-up, degradation when embeddings
+fail at warm-up or per-query), and `/session` / `/auth/login` / `/chat/stream` HTTP
+framing — all via `httpx.ASGITransport` against the real app with the graph stubbed,
+never a real server process or `lifespan` (which would spawn the MCP subprocess and
+call the LLM gateway).
 
 Beyond the automated suite, the full stack (backend + Streamlit) was driven through
 a real browser for this feature: login, per-role tool access (viewer genuinely
@@ -389,17 +395,80 @@ app/
   mcp_server/
     server.py          Stdio MCP server (employee directory, service catalog)
   mock/
-    rag.py             Mock RAG store — replace with the real one
     mock_api.py        Mock REST API the MCP tools call
     documents.py       Seed corpus
+  rag/
+    embeddings.py      Local dense embeddings (fastembed) + cosine similarity
+    sparse.py          BM25 index (rank_bm25)
+    store.py           HybridRagStore - fuses both into one ranking; also the exact-match lookups
 frontend/
   app.py               Streamlit chat client (login, session, streaming chat, activity panel)
   requirements.txt     streamlit, requests
 tests/
 ```
 
-## Replacing the mock RAG
+## Hybrid search
 
-Implement `search`, `metadata_for_type`, `filter_by_metadata` and `get_many` against the
-real store and return the same dict shapes from `app/mock/rag.py`. The tools, agents
-and graph are unchanged.
+`app/rag/` implements real hybrid retrieval over the seed corpus - not a stand-in to
+be swapped later, the search algorithm itself is genuine dense + sparse + fused
+ranking. Only the document *set* is a small fixture (`app/mock/documents.py`); point
+`HybridRagStore` at a different `documents` list (same dict shape as the example in
+the prompt this project started from) and everything else is unchanged.
+
+**Dense** (`app/rag/embeddings.py`) — local ONNX embeddings via
+[fastembed](https://github.com/qdrant/fastembed) (`BAAI/bge-small-en-v1.5`, 384-dim).
+Chosen over the KodeKloud gateway because that gateway has no embeddings endpoint for
+this project's key (every model returns 403/400 on `/embeddings` — confirmed against
+the live gateway). Local also means no per-query cost or latency to an external API.
+Runs on CPU via `asyncio.to_thread`, so it never blocks the event loop. Model weights
+download once (~130MB) on first use and are cached to disk by fastembed; every
+`search()` after that is offline.
+
+**Sparse** (`app/rag/sparse.py`) — classic BM25 via `rank_bm25`, tokenized with the
+same stopword-stripped word tokenizer the mock search used to use directly.
+
+**Fusion** (`app/rag/store.py::HybridRagStore.search`) —
+
+1. Pull the top `HYBRID_CANDIDATE_K` candidates from each method independently
+   (restricted to the requested `document_type` *before* the top-K cut, not after —
+   filtering after would let a document_type filter silently starve a search of a
+   good match that only missed the global top-K).
+2. Take the **union** of both candidate sets - a document that only one method rated
+   highly is still eligible, not excluded for missing the other's cut.
+3. Min-max normalize each method's scores across that union into `[0, 1]` (cosine
+   similarity and raw BM25 scores live on incomparable scales, so combining them
+   raw would let whichever happens to have the larger numbers dominate regardless
+   of actual relevance).
+4. `hybrid_score = HYBRID_ALPHA * dense_norm + (1 - HYBRID_ALPHA) * sparse_norm`,
+   sorted descending, top `limit` returned.
+
+`document_search` returns `score`, `dense_score` and `sparse_score` for every result
+— visible to the agent's reasoning and streamed to the Agent Activity Panel as a
+`retrieval_status` event, so the balance between semantic and keyword matching is
+never a black box.
+
+**Verified on the live corpus**, not just asserted in tests — a genuinely paraphrased
+query ("How do we keep card data safe?", sharing almost no vocabulary with the
+target document) correctly surfaced the Payment Security Policy and related policies
+via the dense signal, with both scores visible throughout.
+
+**Degrades gracefully.** If the embedding model can't be loaded (no network on a
+cold cache, package issue), `search()` falls back to sparse-only rather than
+failing the request — the same "answer with what's available" posture as MCP-tool
+and LLM-model-check failures elsewhere in this app. `GET /health` reports
+`dense_search_available`; the corpus is embedded once at startup
+(`lifespan` → `warm_up()`) so the first real request never pays that latency.
+
+**Configuration** (`.env.example`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Any fastembed-supported model name |
+| `HYBRID_CANDIDATE_K` | `20` | Candidates pulled from each method before fusion |
+| `HYBRID_ALPHA` | `0.5` | Fusion weight — `1.0` = pure dense, `0.0` = pure BM25 |
+
+Tests never load the real model — `tests/test_rag.py` injects a small deterministic
+fake embedder to exercise the fusion math, and a session-scoped fixture
+(`tests/conftest.py`) disables dense search on the shared store for every other
+test, so the full suite stays offline and fast (BM25 alone is enough to exercise the
+tool layer).

@@ -15,7 +15,7 @@ from langchain_core.tools import tool
 from app.activity import emit
 from app.config import get_settings
 from app.llm import get_subagent_llm
-from app.mock.rag import DOCUMENT_TYPES, get_rag_store
+from app.rag import DOCUMENT_TYPES, get_rag_store
 from app.session import get_session_store
 
 logger = logging.getLogger(__name__)
@@ -51,9 +51,8 @@ async def document_search(
                 "valid_document_types": DOCUMENT_TYPES,
             }
         limit = max(1, min(int(limit), 10))
-        documents = await get_rag_store().search(
-            query, document_type=document_type, limit=limit
-        )
+        store = get_rag_store()
+        documents = await store.search(query, document_type=document_type, limit=limit)
         logger.info(
             "document search",
             extra={
@@ -61,7 +60,22 @@ async def document_search(
                 "query": query,
                 "document_type": document_type,
                 "result_count": len(documents),
+                "dense_available": store.dense_available,
             },
+        )
+        emit(
+            "retrieval_status",
+            tool="document_search",
+            message=(
+                f"Hybrid search ({'dense+sparse' if store.dense_available else 'sparse-only, dense unavailable'}) "
+                f"returned {len(documents)} result(s)"
+            ),
+            dense_available=store.dense_available,
+            top_scores=[
+                {"document_id": d["document_id"], "score": d["score"],
+                 "dense": d.get("dense_score"), "sparse": d.get("sparse_score")}
+                for d in documents[:3]
+            ],
         )
         return {"count": len(documents), "documents": documents}
     except Exception as exc:  # noqa: BLE001 - surfaced to the agent, not swallowed

@@ -23,7 +23,7 @@ from app.logging_config import (
     session_id_var,
 )
 from app.mock.mock_api import router as mock_api_router
-from app.mock.rag import DOCUMENT_TYPES
+from app.rag import DOCUMENT_TYPES, get_rag_store
 from app.rate_limit import enforce_rate_limit
 from app.schemas import (
     ChatRequest,
@@ -49,11 +49,16 @@ async def lifespan(app: FastAPI):
     build_retrieval_agents()
     build_graph()
     await check_model_availability()
+    # Embeds the whole corpus once so the first /chat isn't the one paying for model
+    # load + embedding latency. Failure here is non-fatal - search() falls back to
+    # sparse-only, this just avoids a silent surprise on the first request.
+    dense_available = await get_rag_store().warm_up()
     logger.info(
         "application ready",
         extra={
             "event": "app.ready",
             "mcp_available": mcp_available(),
+            "dense_search_available": dense_available,
             "model": settings.model,
             "llm_base_url": settings.llm_base_url,
         },
@@ -205,6 +210,7 @@ async def health() -> dict:
         "mcp_available": mcp_available(),
         "document_types": DOCUMENT_TYPES,
         "role_tools": {role: sorted(tools) for role, tools in ROLE_TOOLS.items()},
+        "dense_search_available": get_rag_store().dense_available,
     }
 
 

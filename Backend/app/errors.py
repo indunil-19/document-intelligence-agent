@@ -7,10 +7,18 @@ class AppError(Exception):
     status_code = 500
     code = "internal_error"
 
-    def __init__(self, message: str, *, details: dict | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: dict | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         super().__init__(message)
         self.message = message
         self.details = details or {}
+        # Response headers to send with the error (e.g. Retry-After on a 429).
+        self.headers = headers or {}
 
 
 class ValidationError(AppError):
@@ -26,6 +34,13 @@ class RetrievalError(AppError):
 class LLMError(AppError):
     status_code = 502
     code = "llm_error"
+
+
+class RateLimitError(AppError):
+    """Caller exhausted their token bucket."""
+
+    status_code = 429
+    code = "rate_limited"
 
 
 class ToolError(AppError):

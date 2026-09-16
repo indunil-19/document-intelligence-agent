@@ -172,9 +172,62 @@ The orchestration agent uses structured output and the retrieval agent uses tool
 calling, so **the model you pick must support function/tool calling.** A model without
 it will fail on the orchestrator's structured-output call.
 
+## Rate limiting
+
+`POST /chat` is protected by a token bucket per caller (`app/rate_limit.py`). Every
+other endpoint — `/health`, `/mock-api/*` — is unlimited: the MCP server calls
+`/mock-api` over HTTP several times *during* a single `/chat` turn, so limiting it
+would make one chat request throttle itself.
+
+**Identity.** There's no authentication in this app, so the caller is identified by
+an `X-User-Id` request header, falling back to the client IP when it's absent:
+
+```bash
+curl -X POST http://127.0.0.1:8000/chat -H "X-User-Id: alice"   -H "Content-Type: application/json" -d '{"message": "..."}'
+```
+
+`session_id` was deliberately not used as the key — it's client-chosen and
+unvalidated, so a caller could bypass a per-session limit just by omitting it.
+Swapping in real auth later is a one-function change (`resolve_client_id`).
+
+**Algorithm.** Each caller gets an independent bucket that refills continuously
+(`tokens/sec = RATE_LIMIT_REQUESTS / RATE_LIMIT_WINDOW_SECONDS`), rather than
+resetting in fixed windows — that avoids the thundering-herd retry spike a fixed
+window causes right after it rolls over. Refill is lazy (computed from elapsed time
+on each request, no background task) and uses `time.monotonic()` so a wall-clock
+jump can't stall or over-fill a bucket. `RATE_LIMIT_BURST` sets bucket capacity
+independently of the refill rate — how much saved-up allowance a caller can spend at
+once — and defaults to the same value as `RATE_LIMIT_REQUESTS`.
+
+**Configuration** (`.env.example`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `RATE_LIMIT_ENABLED` | `true` | Set `false` to disable entirely |
+| `RATE_LIMIT_REQUESTS` | `20` | Tokens refilled per window — the sustained rate |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Window the refill rate is expressed over |
+| `RATE_LIMIT_BURST` | `0` | Bucket capacity; `0` means "same as requests" |
+| `RATE_LIMIT_IDLE_TTL_SECONDS` | `900` | Idle buckets are dropped after this long |
+
+**On rejection**, the caller gets a `429` through the normal `ErrorResponse` envelope,
+plus `Retry-After`, `X-RateLimit-Limit` and `X-RateLimit-Remaining` headers:
+
+```json
+{
+  "code": "rate_limited",
+  "message": "Rate limit exceeded. Try again in 26 seconds.",
+  "request_id": "9a7b8579acc3",
+  "details": {"limit": 20, "window_seconds": 60.0, "retry_after_seconds": 26}
+}
+```
+
+Enforcement is a FastAPI dependency on the route, not middleware — that keeps it
+inside `correlation_middleware` (so a 429 still carries `request_id` and the
+`x-request-id` header) and keeps it scoped to `/chat` without an exemption list.
+
 ## Configuration
 
-All settings are environment variables (see `.env.example`). `MODEL` and
+All other settings are environment variables (see `.env.example`). `MODEL` and
 `SUBAGENT_MODEL` both default to `gpt-oss-120b` — confirm against
 `python -m scripts.list_models`, since the gateway decides what is available. Set
 `SUBAGENT_MODEL` to a cheaper model if analytics fan-outs get expensive.
@@ -186,10 +239,13 @@ All settings are environment variables (see `.env.example`). `MODEL` and
 pytest
 ```
 
-20 tests, no API key or network needed — LLM calls are stubbed. They cover the tools
-and their failure paths, graph routing (retrieval / direct / out-of-scope), evidence
-and source propagation, degradation when the orchestrator or retrieval fails, and the
-analytics inline/fan-out split including partial and total sub-agent failure.
+No API key or network needed — LLM calls are stubbed throughout. Coverage: the
+tools and their failure paths, graph routing (retrieval / direct / out-of-scope),
+evidence and source propagation, degradation when the orchestrator or retrieval
+fails, the analytics inline/fan-out split including partial and total sub-agent
+failure, and rate limiting — bucket math against a fake clock (refill, burst,
+eviction, concurrency), per-caller isolation, and HTTP-level 429/header/exemption
+behaviour via `httpx.ASGITransport` (no server process, no lifespan).
 
 ## Layout
 
@@ -203,6 +259,7 @@ app/
   schemas.py           Request/response models
   llm.py               Chat model factory + gateway model check
   session.py           In-memory session + document cache
+  rate_limit.py         Token bucket rate limiting (per-caller, /chat only)
   agents/
     loader.py          Loads instruction files
     instructions/      orchestrator.md · retrieval.md · response.md

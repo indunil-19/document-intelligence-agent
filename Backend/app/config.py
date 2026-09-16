@@ -41,6 +41,17 @@ class Settings(BaseSettings):
     mock_api_base_url: str = "http://127.0.0.1:8000/mock-api"
     enable_mcp: bool = True
 
+    # --- Rate limiting ---
+    rate_limit_enabled: bool = True
+    # Tokens refilled per window. This is the sustained request rate per caller.
+    rate_limit_requests: int = 20
+    rate_limit_window_seconds: float = 60.0
+    # Bucket capacity, i.e. how much unused allowance can be spent at once.
+    # 0 means "same as rate_limit_requests".
+    rate_limit_burst: int = 0
+    # Buckets untouched for this long are dropped to bound memory.
+    rate_limit_idle_ttl_seconds: float = 900.0
+
     # --- Retrieval behaviour ---
     # Tool rounds the retrieval agent may take before it is cut off.
     max_retrieval_steps: int = 10

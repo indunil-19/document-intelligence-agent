@@ -5,7 +5,7 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -23,6 +23,7 @@ from app.logging_config import (
 )
 from app.mock.mock_api import router as mock_api_router
 from app.mock.rag import DOCUMENT_TYPES
+from app.rate_limit import enforce_rate_limit
 from app.schemas import ChatRequest, ChatResponse, ErrorResponse
 from app.tools.mcp_tools import load_mcp_tools, mcp_available
 
@@ -91,6 +92,7 @@ async def app_error_handler(request: Request, exc: AppError):
             request_id=request_id_var.get(),
             details=exc.details,
         ).model_dump(),
+        headers=exc.headers or None,
     )
 
 
@@ -120,7 +122,12 @@ async def unhandled_error_handler(request: Request, exc: Exception):
     )
 
 
-@app.post("/chat", response_model=ChatResponse, tags=["chat"])
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    tags=["chat"],
+    dependencies=[Depends(enforce_rate_limit)],
+)
 async def chat(request: ChatRequest) -> ChatResponse:
     """Ask a question about internal documentation.
 

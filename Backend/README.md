@@ -10,12 +10,12 @@ it is real hybrid search — dense embeddings + BM25, fused into one ranking. Se
 [Hybrid search](#hybrid-search) below.
 
 ```bash
-# terminal 1
+# terminal 1 - from this Backend/ directory
 pip install -r requirements.txt
 cp .env.example .env && $EDITOR .env   # set LLM_API_KEY
 uvicorn app.main:app --reload   # first start downloads the embedding model (~130MB), then caches it
 
-# terminal 2
+# terminal 2 - from the repo root (frontend/ is a sibling of Backend/, not inside it)
 pip install -r frontend/requirements.txt
 streamlit run frontend/app.py
 ```
@@ -103,11 +103,13 @@ lookup the client cannot influence — an unrecognised or missing header default
 
 ## Frontend
 
-`frontend/app.py` is a Streamlit chat client, kept deliberately thin: it calls
-`/auth/login`, `/session` and `/chat/stream` over plain HTTP and renders what the
-backend already reports. It does not call an LLM or the graph directly.
+`frontend/` lives at the repo root, a sibling of this `Backend/` directory, not
+inside it. `frontend/app.py` is a Streamlit chat client, kept deliberately thin: it
+calls `/auth/login`, `/session` and `/chat/stream` over plain HTTP and renders what
+the backend already reports. It does not call an LLM or the graph directly.
 
 ```bash
+# from the repo root
 pip install -r frontend/requirements.txt
 streamlit run frontend/app.py
 ```
@@ -369,42 +371,49 @@ updating live mid-stream were all observed directly, not just asserted in tests.
 
 ## Layout
 
+`frontend/` is a sibling of this `Backend/` directory at the repo root, not nested
+inside it - the two are independently installable (separate `requirements.txt`)
+and talk to each other only over HTTP.
+
 ```
-app/
-  main.py              FastAPI app, exception handlers, correlation middleware, all endpoints
-  chat_service.py      Session handling + graph invocation; stream_chat() feeds both /chat and /chat/stream
-  config.py            Settings
-  logging_config.py    JSON logging with request/session context
-  errors.py            Domain exceptions
-  schemas.py           Request/response models, including ActivityEvent
-  llm.py               Chat model factory + gateway model check
-  session.py           In-memory session + document cache
-  rate_limit.py        Token bucket rate limiting (per-caller, /chat + /chat/stream only)
-  auth.py              Hardcoded demo users, roles, per-role tool lists, role resolution
-  activity.py          Real-time activity events: contextvar sink, emit(), the tool-call callback handler
-  agents/
-    loader.py          Loads instruction files
-    instructions/      orchestrator.md · retrieval.md · response.md
-  graph/
-    builder.py         Graph wiring
-    state.py           Shared state (includes role)
-    nodes/             orchestrator.py · retrieval.py (role-scoped agents) · response.py (streams the answer)
-  tools/
-    rag_tools.py       The four RAG tools + analytics fan-out + activity emit calls
-    mcp_tools.py       MCP client loading, degrades if unavailable
-  mcp_server/
-    server.py          Stdio MCP server (employee directory, service catalog)
-  mock/
-    mock_api.py        Mock REST API the MCP tools call
-    documents.py       Seed corpus
-  rag/
-    embeddings.py      Local dense embeddings (fastembed) + cosine similarity
-    sparse.py          BM25 index (rank_bm25)
-    store.py           HybridRagStore - fuses both into one ranking; also the exact-match lookups
-frontend/
-  app.py               Streamlit chat client (login, session, streaming chat, activity panel)
-  requirements.txt     streamlit, requests
-tests/
+repo root/
+├── frontend/
+│   ├── app.py               Streamlit chat client (login, session, streaming chat, activity panel)
+│   └── requirements.txt     streamlit, requests
+└── Backend/
+    ├── app/
+    │   ├── main.py              FastAPI app, exception handlers, correlation middleware, all endpoints
+    │   ├── chat_service.py      Session handling + graph invocation; stream_chat() feeds both /chat and /chat/stream
+    │   ├── config.py            Settings
+    │   ├── logging_config.py    JSON logging with request/session context
+    │   ├── errors.py            Domain exceptions
+    │   ├── schemas.py           Request/response models, including ActivityEvent
+    │   ├── llm.py               Chat model factory + gateway model check
+    │   ├── tracing.py           LangSmith tracing (optional; off unless configured)
+    │   ├── session.py           In-memory session + document cache
+    │   ├── rate_limit.py        Token bucket rate limiting (per-caller, /chat + /chat/stream only)
+    │   ├── auth.py              Hardcoded demo users, roles, per-role tool lists, role resolution
+    │   ├── activity.py          Real-time activity events: contextvar sink, emit(), the tool-call callback handler
+    │   ├── agents/
+    │   │   ├── loader.py            Loads instruction files
+    │   │   └── instructions/        orchestrator.md · retrieval.md · response.md
+    │   ├── graph/
+    │   │   ├── builder.py           Graph wiring
+    │   │   ├── state.py             Shared state (includes role)
+    │   │   └── nodes/               orchestrator.py · retrieval.py (role-scoped agents) · response.py (streams the answer)
+    │   ├── tools/
+    │   │   ├── rag_tools.py         The four RAG tools + analytics fan-out + activity emit calls
+    │   │   └── mcp_tools.py         MCP client loading, degrades if unavailable
+    │   ├── mcp_server/
+    │   │   └── server.py            Stdio MCP server (employee directory, service catalog)
+    │   ├── mock/
+    │   │   ├── mock_api.py          Mock REST API the MCP tools call
+    │   │   └── documents.py         Seed corpus
+    │   └── rag/
+    │       ├── embeddings.py        Local dense embeddings (fastembed) + cosine similarity
+    │       ├── sparse.py            BM25 index (rank_bm25)
+    │       └── store.py             HybridRagStore - fuses both into one ranking; also the exact-match lookups
+    └── tests/
 ```
 
 ## Hybrid search

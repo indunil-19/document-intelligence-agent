@@ -10,10 +10,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.chat_service import handle_chat
-from app.config import get_settings
+from app.config import env_file_status, get_settings
 from app.errors import AppError
 from app.graph.builder import build_graph
 from app.graph.nodes.retrieval import build_retrieval_agent
+from app.llm import check_model_availability
 from app.logging_config import (
     configure_logging,
     new_request_id,
@@ -32,13 +33,20 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("settings loaded", extra={"event": "app.settings", **env_file_status()})
     # MCP tools first: the retrieval agent binds whatever is available at build time.
     await load_mcp_tools()
     build_retrieval_agent()
     build_graph()
+    await check_model_availability()
     logger.info(
         "application ready",
-        extra={"event": "app.ready", "mcp_available": mcp_available()},
+        extra={
+            "event": "app.ready",
+            "mcp_available": mcp_available(),
+            "model": settings.model,
+            "llm_base_url": settings.llm_base_url,
+        },
     )
     yield
     logger.info("application shutting down", extra={"event": "app.shutdown"})
@@ -127,6 +135,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "model": settings.model,
+        "llm_base_url": settings.llm_base_url,
         "mcp_available": mcp_available(),
         "document_types": DOCUMENT_TYPES,
     }

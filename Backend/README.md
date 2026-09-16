@@ -86,11 +86,15 @@ directories are unavailable.
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # then set ANTHROPIC_API_KEY
+cp .env.example .env        # then set LLM_API_KEY
+python -m scripts.list_models   # see what your gateway serves, then set MODEL
 uvicorn app.main:app --reload
 ```
 
-The app fails fast at startup if `ANTHROPIC_API_KEY` is missing.
+The app fails fast at startup if `LLM_API_KEY` is missing. It also asks the gateway
+for its model list at startup and logs a warning (`llm.model_missing`) if the
+configured `MODEL` is not on it — a bad model id shows up in the logs, not as a
+mystery 400 on the first request.
 
 ## Usage
 
@@ -128,7 +132,7 @@ Things worth trying:
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | Status, model, whether MCP is connected, known document types |
+| `GET /health` | Status, model, gateway URL, whether MCP is connected, known document types |
 | `GET /mock-api/employees` · `/services` | The mock backend the MCP tools consume |
 | `GET /docs` | OpenAPI UI |
 
@@ -151,11 +155,30 @@ full pipeline.
 `tool.analytics.subagent`, `node.retrieval`, `node.response`, `chat.completed`
 (with `duration_ms`).
 
+## LLM provider
+
+The app talks to any **OpenAI-compatible** `/v1/chat/completions` gateway through
+`langchain-openai`, configured by two settings:
+
+```
+LLM_BASE_URL=https://api.ai.kodekloud.com/v1
+LLM_API_KEY=...
+```
+
+Changing provider is a `.env` change, not a code change — `app/llm.py` is the only
+module that constructs a model.
+
+The orchestration agent uses structured output and the retrieval agent uses tool
+calling, so **the model you pick must support function/tool calling.** A model without
+it will fail on the orchestrator's structured-output call.
+
 ## Configuration
 
-All settings are environment variables (see `.env.example`). Both `MODEL` and
-`SUBAGENT_MODEL` default to `claude-opus-5`; set `SUBAGENT_MODEL` to a cheaper model if
-analytics fan-outs get expensive. `ENABLE_MCP=false` runs without the directory tools.
+All settings are environment variables (see `.env.example`). `MODEL` and
+`SUBAGENT_MODEL` both default to `gpt-oss-120b` — confirm against
+`python -m scripts.list_models`, since the gateway decides what is available. Set
+`SUBAGENT_MODEL` to a cheaper model if analytics fan-outs get expensive.
+`ENABLE_MCP=false` runs without the directory tools.
 
 ## Tests
 
@@ -163,7 +186,7 @@ analytics fan-outs get expensive. `ENABLE_MCP=false` runs without the directory 
 pytest
 ```
 
-19 tests, no API key or network needed — LLM calls are stubbed. They cover the tools
+20 tests, no API key or network needed — LLM calls are stubbed. They cover the tools
 and their failure paths, graph routing (retrieval / direct / out-of-scope), evidence
 and source propagation, degradation when the orchestrator or retrieval fails, and the
 analytics inline/fan-out split including partial and total sub-agent failure.
@@ -178,7 +201,7 @@ app/
   logging_config.py    JSON logging with request/session context
   errors.py            Domain exceptions
   schemas.py           Request/response models
-  llm.py               Chat model factory
+  llm.py               Chat model factory + gateway model check
   session.py           In-memory session + document cache
   agents/
     loader.py          Loads instruction files

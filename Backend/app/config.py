@@ -1,19 +1,34 @@
 """Application settings, loaded from environment / .env."""
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Anchor the .env path to the project root. A bare ".env" would resolve against the
+# current working directory, so the file would be silently ignored whenever the
+# process is started from anywhere but here (IDE run configs, uvicorn from a parent
+# directory, containers with a different WORKDIR).
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_FILE = PROJECT_ROOT / ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     # --- LLM ---
-    anthropic_api_key: str = ""
-    model: str = "claude-opus-5"
+    # Any OpenAI-compatible chat-completions gateway.
+    llm_base_url: str = "https://api.ai.kodekloud.com/v1"
+    llm_api_key: str = ""
+    model: str = "gpt-oss-120b"
     # Used by analytics sub-agents. Defaults to the main model; override to trade
     # cost for depth on large fan-outs.
-    subagent_model: str = "claude-opus-5"
+    subagent_model: str = "gpt-oss-120b"
     max_tokens: int = 4096
+    temperature: float = 0.0
     llm_timeout_seconds: float = 120.0
 
     # --- Service ---
@@ -27,7 +42,8 @@ class Settings(BaseSettings):
     enable_mcp: bool = True
 
     # --- Retrieval behaviour ---
-    max_retrieval_steps: int = 6
+    # Tool rounds the retrieval agent may take before it is cut off.
+    max_retrieval_steps: int = 10
     # Above this many cached documents, the analytics tool fans out to sub-agents.
     analytics_fanout_threshold: int = 10
     analytics_chunk_size: int = 5
@@ -37,3 +53,12 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def env_file_status() -> dict:
+    """Where the .env was looked for and whether it was there.
+
+    Reported at startup so a missing or misplaced .env is visible in the logs
+    rather than showing up later as an unexplained empty setting.
+    """
+    return {"env_file": str(ENV_FILE), "env_file_found": ENV_FILE.is_file()}

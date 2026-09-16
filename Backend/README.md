@@ -2,10 +2,25 @@
 
 An async FastAPI chat endpoint backed by a three-agent LangGraph pipeline over internal
 company documents (policies, architecture docs, runbooks, incident reports, product
-specs, meeting notes).
+specs, meeting notes), plus a Streamlit frontend that shows the pipeline's internal
+state in real time.
 
 The RAG layer is mocked — `app/mock/rag.py` is a small async facade over a seed corpus.
 Replace its four methods with the real vector store and nothing else changes.
+
+```bash
+# terminal 1
+pip install -r requirements.txt
+cp .env.example .env && $EDITOR .env   # set LLM_API_KEY
+uvicorn app.main:app --reload
+
+# terminal 2
+pip install -r frontend/requirements.txt
+streamlit run frontend/app.py
+```
+Open the Streamlit URL, log in with one of the three demo accounts shown in the
+sidebar (`viewer` / `viewer123`, or `analyst`, or `admin` — passwords match the
+username), and chat. See [Frontend](#frontend) and [Roles and tool access](#roles-and-tool-access) below.
 
 ## Architecture
 
@@ -56,7 +71,91 @@ single bad call degrades the answer instead of failing the request.
 ### Response generation agent
 The only agent that addresses the user. Grounds every claim in the retrieval agent's
 evidence brief, cites document ids inline, flags stale or draft sources, and handles
-the out-of-scope and clarification cases.
+the out-of-scope and clarification cases. Streams its answer token-by-token
+(`llm.astream`) rather than waiting for the whole response, so the chat window can
+render it incrementally.
+
+## Roles and tool access
+
+Three hardcoded demo accounts, one per role (`app/auth.py` — plaintext, no tokens,
+demo only, by design):
+
+| Role | Username / password | Tools |
+|---|---|---|
+| Viewer | `viewer` / `viewer123` | `document_search` |
+| Analyst | `analyst` / `analyst123` | `document_search`, `metadata_retrieval`, `filter_by_metadata`, `analyze_documents` |
+| Admin | `admin` / `admin123` | all analyst tools, plus `employee_directory`, `service_catalog` |
+
+This is enforced by construction, not by prompting. `build_retrieval_agents()` builds
+one **separate `create_react_agent` per role** at startup, each bound only to the
+tools `ROLE_TOOLS` grants — a viewer's agent object has no `employee_directory` tool
+in it at all, so the model has nothing to call even if it tried. Confirmed live: a
+viewer asked "who owns the payment service and who's on call" never invokes
+`employee_directory`/`service_catalog` (they aren't bound) and instead answers from
+documents alone; the same question from `admin` correctly calls both.
+
+`POST /auth/login` checks the password once; after that, the caller's role is
+resolved server-side on every `/chat`/`/chat/stream` call from the `X-User-Id`
+header (the same header rate limiting already uses for caller identity) via a
+lookup the client cannot influence — an unrecognised or missing header defaults to
+`viewer`, the least-privileged role, rather than rejecting the request.
+
+## Frontend
+
+`frontend/app.py` is a Streamlit chat client, kept deliberately thin: it calls
+`/auth/login`, `/session` and `/chat/stream` over plain HTTP and renders what the
+backend already reports. It does not call an LLM or the graph directly.
+
+```bash
+pip install -r frontend/requirements.txt
+streamlit run frontend/app.py
+```
+
+**Chat window** (left column) — multi-turn history via `st.chat_message`, with the
+answer streamed in token-by-token as it arrives.
+
+**Agent Activity Panel** (right column) — every internal step, as it happens, via
+`st.status()`:
+
+| Requirement | Where it comes from |
+|---|---|
+| Current agent state | The headline `st.status()` label, updated on every event to that event's own message — one source of truth, not a duplicate mapping |
+| Active LangGraph node | `node_start`/`node_end` events from the orchestrator, retrieval and response nodes |
+| Tool calls being executed | `ActivityCallbackHandler` (`app/activity.py`) — a standard LangChain callback attached to the retrieval agent's invocation, so it fires for every tool call uniformly, RAG and MCP alike, with no per-tool code |
+| Retrieval status | Narration from inside the retrieval agent and the `analyze_documents` fan-out (e.g. "13 documents exceed the inline threshold - fanning out to 3 sub-agents") |
+| Memory updates | Session cache writes (`filter_by_metadata`) and conversation-history writes (start/resume of a session, turn appended at the end) |
+| Validation results | The orchestrator's scope check (in scope? routed where?) and the retrieval node's evidence check (found something, or not, or cut off by the step budget) |
+| Final response generation | `node_start`/token events on the response node, then a terminal `final` event carrying the full response payload |
+
+Past turns collapse into an expander (`✅`/`🛑` icon by outcome); the current turn
+stays expanded while it streams. "New chat" mints a fresh session id via `/session`
+and clears history; "Log out" clears the login.
+
+## Session and streaming endpoints
+
+**`POST /session`** → `{"session_id": "<uuid>"}`. Mints an empty session ahead of the
+first message, so the frontend has a session id to display and reuse from the start
+of the conversation, not just after the first reply.
+
+**`POST /chat/stream`** — same request body as `/chat` (`message`, optional
+`session_id`), same role resolution via `X-User-Id`, same rate limiting. Instead of
+one JSON response it streams NDJSON (`application/x-ndjson`): one
+`app.schemas.ActivityEvent` per line —
+
+```json
+{"type": "node_start", "node": "retrieval", "message": "Gathering evidence (role: admin)", "data": {}}
+{"type": "tool_start", "tool": "service_catalog", "message": "Calling service_catalog", "data": {...}}
+{"type": "token", "node": "respond", "message": "", "data": {"text": "The "}}
+{"type": "final", "message": "Response generated", "data": {"session_id": "...", "answer": "...", "sources": [...], ...}}
+```
+
+ending in either a `"final"` line (the completed `ChatResponse`, embedded in `data`)
+or an `"error"` line — the stream itself always starts with `200 OK`, so a mid-turn
+failure is reported as the last line rather than an HTTP error. (A request rejected
+*before* streaming starts, e.g. `429` from the rate limiter, is still a normal single
+JSON `ErrorResponse` — the frontend checks the status code before trying to parse
+NDJSON.) `/chat` is unchanged and kept for non-streaming/simple callers — it's a
+thin wrapper that drains the same stream and returns just the final payload.
 
 ## Analytics fan-out
 
@@ -132,7 +231,10 @@ Things worth trying:
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | Status, model, gateway URL, whether MCP is connected, known document types |
+| `POST /auth/login` | Demo login — checks a hardcoded username/password, returns the role |
+| `POST /session` | Mints a fresh chat session id |
+| `POST /chat/stream` | Same as `/chat`, but streams NDJSON activity events — see below |
+| `GET /health` | Status, model, gateway URL, whether MCP is connected, known document types, the role→tools map |
 | `GET /mock-api/employees` · `/services` | The mock backend the MCP tools consume |
 | `GET /docs` | OpenAPI UI |
 
@@ -179,8 +281,10 @@ other endpoint — `/health`, `/mock-api/*` — is unlimited: the MCP server cal
 `/mock-api` over HTTP several times *during* a single `/chat` turn, so limiting it
 would make one chat request throttle itself.
 
-**Identity.** There's no authentication in this app, so the caller is identified by
-an `X-User-Id` request header, falling back to the client IP when it's absent:
+**Identity.** There's no authentication in this app beyond the demo login, so the
+caller is identified by an `X-User-Id` request header, falling back to the client IP
+when it's absent — the same header the role resolver (`app/auth.py`) reads, so one
+header does double duty as both the rate-limit key and the tool-access identity:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/chat -H "X-User-Id: alice"   -H "Content-Type: application/json" -d '{"message": "..."}'
@@ -243,32 +347,44 @@ No API key or network needed — LLM calls are stubbed throughout. Coverage: the
 tools and their failure paths, graph routing (retrieval / direct / out-of-scope),
 evidence and source propagation, degradation when the orchestrator or retrieval
 fails, the analytics inline/fan-out split including partial and total sub-agent
-failure, and rate limiting — bucket math against a fake clock (refill, burst,
-eviction, concurrency), per-caller isolation, and HTTP-level 429/header/exemption
-behaviour via `httpx.ASGITransport` (no server process, no lifespan).
+failure, rate limiting (bucket math against a fake clock, per-caller isolation,
+HTTP-level 429/header/exemption behaviour), roles (the exact tool list per role,
+role resolution and its fail-closed default), activity events (emission, the
+tool-call callback handler, context propagation across concurrent tasks), and
+`/session` / `/auth/login` / `/chat/stream` HTTP framing — all via
+`httpx.ASGITransport` against the real app with the graph stubbed, never a real
+server process or `lifespan` (which would spawn the MCP subprocess and call the LLM
+gateway).
+
+Beyond the automated suite, the full stack (backend + Streamlit) was driven through
+a real browser for this feature: login, per-role tool access (viewer genuinely
+cannot invoke the MCP tools; admin can), multi-turn memory, and the activity panel
+updating live mid-stream were all observed directly, not just asserted in tests.
 
 ## Layout
 
 ```
 app/
-  main.py              FastAPI app, exception handlers, correlation middleware
-  chat_service.py      Session handling + graph invocation
+  main.py              FastAPI app, exception handlers, correlation middleware, all endpoints
+  chat_service.py      Session handling + graph invocation; stream_chat() feeds both /chat and /chat/stream
   config.py            Settings
   logging_config.py    JSON logging with request/session context
   errors.py            Domain exceptions
-  schemas.py           Request/response models
+  schemas.py           Request/response models, including ActivityEvent
   llm.py               Chat model factory + gateway model check
   session.py           In-memory session + document cache
-  rate_limit.py         Token bucket rate limiting (per-caller, /chat only)
+  rate_limit.py        Token bucket rate limiting (per-caller, /chat + /chat/stream only)
+  auth.py              Hardcoded demo users, roles, per-role tool lists, role resolution
+  activity.py          Real-time activity events: contextvar sink, emit(), the tool-call callback handler
   agents/
     loader.py          Loads instruction files
     instructions/      orchestrator.md · retrieval.md · response.md
   graph/
     builder.py         Graph wiring
-    state.py           Shared state
-    nodes/             orchestrator.py · retrieval.py · response.py
+    state.py           Shared state (includes role)
+    nodes/             orchestrator.py · retrieval.py (role-scoped agents) · response.py (streams the answer)
   tools/
-    rag_tools.py       The four RAG tools + analytics fan-out
+    rag_tools.py       The four RAG tools + analytics fan-out + activity emit calls
     mcp_tools.py       MCP client loading, degrades if unavailable
   mcp_server/
     server.py          Stdio MCP server (employee directory, service catalog)
@@ -276,6 +392,9 @@ app/
     rag.py             Mock RAG store — replace with the real one
     mock_api.py        Mock REST API the MCP tools call
     documents.py       Seed corpus
+frontend/
+  app.py               Streamlit chat client (login, session, streaming chat, activity panel)
+  requirements.txt     streamlit, requests
 tests/
 ```
 

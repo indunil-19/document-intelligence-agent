@@ -19,6 +19,11 @@ uvicorn app.main:app --reload   # first start downloads the embedding model (~13
 pip install -r frontend/requirements.txt
 streamlit run frontend/app.py
 ```
+Or both at once with Docker — see [Docker](#docker) below:
+```bash
+cp Backend/.env.example Backend/.env && $EDITOR Backend/.env
+docker compose up --build
+```
 Open the Streamlit URL, log in with one of the three demo accounts shown in the
 sidebar (`viewer` / `viewer123`, or `analyst`, or `admin` — passwords match the
 username), and chat. See [Frontend](#frontend) and [Roles and tool access](#roles-and-tool-access) below.
@@ -197,6 +202,37 @@ The app fails fast at startup if `LLM_API_KEY` is missing. It also asks the gate
 for its model list at startup and logs a warning (`llm.model_missing`) if the
 configured `MODEL` is not on it — a bad model id shows up in the logs, not as a
 mystery 400 on the first request.
+
+## Docker
+
+`docker-compose.yml` lives at the repo root (a sibling of `Backend/`, alongside
+`frontend/`) and builds both services.
+
+```bash
+cp Backend/.env.example Backend/.env   # then fill it in - same file local dev uses
+docker compose up --build
+```
+
+- **Backend** → `http://localhost:8000` (`/docs`, `/health`).
+- **Frontend** → `http://localhost:8501`.
+- `frontend`'s `depends_on: condition: service_healthy` means it won't start
+  hammering the backend before `/health` reports ready — on a cold cache that
+  includes downloading the ~130MB embedding model, so first boot can take a couple
+  of minutes; `docker compose logs -f backend` shows progress.
+- The embedding model is cached in a named volume (`fastembed_cache`), not the
+  container's own filesystem, so `docker compose down && docker compose up` doesn't
+  re-download it — only `docker compose down -v` does (removes the volume too).
+- The MCP server (employee directory, service catalog) runs as a subprocess *inside*
+  the backend container, exactly as it does without Docker — it's not a separate
+  service, so there's nothing extra to configure for it.
+- Session history and rate-limit state are in-memory per container, same as running
+  without Docker — restarting the `backend` container clears both. Not a Docker-
+  specific limitation, just worth restating here since a container restart is a more
+  routine event than a local process restart.
+- `HOST=127.0.0.1` in `.env` is not a mistake and does not need changing for
+  Docker — that setting only affects `python app/main.py`'s direct-run path, never
+  the container's actual `uvicorn ... --host 0.0.0.0` entrypoint (`Backend/Dockerfile`),
+  which is what makes the container reachable from outside itself.
 
 ## Usage
 
@@ -377,10 +413,13 @@ and talk to each other only over HTTP.
 
 ```
 repo root/
+├── docker-compose.yml       Builds + runs both services together
 ├── frontend/
 │   ├── app.py               Streamlit chat client (login, session, streaming chat, activity panel)
-│   └── requirements.txt     streamlit, requests
+│   ├── requirements.txt     streamlit, requests
+│   └── Dockerfile
 └── Backend/
+    ├── Dockerfile
     ├── app/
     │   ├── main.py              FastAPI app, exception handlers, correlation middleware, all endpoints
     │   ├── chat_service.py      Session handling + graph invocation; stream_chat() feeds both /chat and /chat/stream

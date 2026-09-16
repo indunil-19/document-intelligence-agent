@@ -13,6 +13,8 @@ fastembed itself - no code here needs to know where.
 import asyncio
 import logging
 
+from app.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,11 +50,16 @@ class Embedder:
     def _load_model(self):
         from fastembed import TextEmbedding
 
+        cache_dir = get_settings().embedding_cache_dir
         logger.info(
             "loading embedding model",
-            extra={"event": "embeddings.loading", "model": self._model_name},
+            extra={
+                "event": "embeddings.loading",
+                "model": self._model_name,
+                "cache_dir": cache_dir or "(fastembed default)",
+            },
         )
-        model = TextEmbedding(model_name=self._model_name)
+        model = TextEmbedding(model_name=self._model_name, cache_dir=cache_dir)
         logger.info(
             "embedding model ready",
             extra={"event": "embeddings.ready", "model": self._model_name},

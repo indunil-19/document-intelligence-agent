@@ -1,0 +1,35 @@
+services:
+  backend:
+    build:
+      context: ./Backend
+    ports:
+      - "8000:8000"
+    # Reuses the same .env you already use for local dev - copy Backend/.env.example
+    # to Backend/.env and fill it in before running `docker compose up`.
+    env_file:
+      - ./Backend/.env
+    environment:
+      # Overrides .env's default (unset -> fastembed's own OS-temp-dir default) so
+      # the ~130MB embedding model survives `docker compose down` / recreation
+      # instead of re-downloading every time.
+      EMBEDDING_CACHE_DIR: /data/fastembed_cache
+    volumes:
+      - fastembed_cache:/data/fastembed_cache
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "8501:8501"
+    environment:
+      # Compose's built-in DNS resolves service names - "backend" here, not
+      # localhost/127.0.0.1, since these are two separate containers.
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  fastembed_cache:

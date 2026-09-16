@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # Local ONNX embedding model (fastembed) - no API key, runs on CPU, weights are
     # downloaded once and cached under FASTEMBED_CACHE_DIR / ~/.cache.
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Where fastembed caches the downloaded model. Unset (the default) lets
+    # fastembed use its own default - the OS temp directory - which is fine for
+    # local dev but means a container re-downloads the model on every recreation
+    # unless this points at a mounted volume (see docker-compose.yml).
+    embedding_cache_dir: str | None = None
     # Candidates pulled from each of dense/sparse before the two are fused. Larger
     # catches more near-misses on one axis; smaller is cheaper per query.
     hybrid_candidate_k: int = 20

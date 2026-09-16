@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.git/
+.gitignore
+
+# Secrets and local config never belong in an image layer - injected at runtime
+# via docker-compose's env_file instead.
+.env
+.env.example
+
+# Not needed at runtime.
+tests/
+requirements-dev.txt
+pytest.ini
+README.md

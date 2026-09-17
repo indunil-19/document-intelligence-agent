@@ -42,6 +42,29 @@ ICONS = {
 
 STATUS_ICON = {"running": "⏳", "complete": "✅", "error": "\U0001f6d1"}
 
+# A small bouncing-dots indicator, shown in the assistant's chat bubble from the
+# moment it's created until the first real answer token arrives - orchestration and
+# retrieval (tool calls) can take a few seconds before any text starts streaming,
+# and an empty bubble in that gap reads as "did this hang?" rather than "in progress".
+# currentColor picks up Streamlit's own text color, so it looks right in both themes.
+_TYPING_INDICATOR_CSS = """
+<style>
+.typing-dots { display: inline-flex; align-items: center; gap: 4px; padding: 2px 0; }
+.typing-dots span {
+    width: 7px; height: 7px; border-radius: 50%;
+    background-color: currentColor; opacity: 0.4;
+    animation: typing-bounce 1.2s infinite ease-in-out;
+}
+.typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes typing-bounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+    30% { transform: translateY(-6px); opacity: 1; }
+}
+</style>
+"""
+_TYPING_INDICATOR_HTML = '<div class="typing-dots"><span></span><span></span><span></span></div>'
+
 
 # --- session state --------------------------------------------------------------
 
@@ -175,6 +198,7 @@ def _run_turn(prompt: str, chat_col, activity_col) -> None:
     with chat_col:
         st.chat_message("user").write(prompt)
         assistant_placeholder = st.chat_message("assistant").empty()
+        assistant_placeholder.markdown(_TYPING_INDICATOR_HTML, unsafe_allow_html=True)
 
     turn = {"question": prompt, "events": [], "status": "running"}
 
@@ -281,6 +305,7 @@ def _render_sidebar() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Internal Doc Assistant", layout="wide")
+    st.markdown(_TYPING_INDICATOR_CSS, unsafe_allow_html=True)
     _init_state()
     _render_sidebar()
 

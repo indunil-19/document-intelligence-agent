@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # the mock document corpus - everything the app needs is a plain file copy, no
 # build step.
 COPY app ./app
-COPY scripts ./scripts
+# COPY scripts ./scripts
 
 # Run as a non-root user; own /data too since the fastembed cache volume mounts there.
 RUN useradd --create-home --uid 1000 appuser \
